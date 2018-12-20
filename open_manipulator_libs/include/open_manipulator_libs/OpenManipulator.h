@@ -60,7 +60,8 @@ private:
   virtual ~OPEN_MANIPULATOR();
 
   void initManipulator(bool using_platform, STRING usb_port = "/dev/ttyUSB0", STRING baud_rate = "1000000");
-  void openManipulatorProcess(double present_time);
+  void communicationProcessToActuator(JointWayPoint goal_joint_value, std::vector<double> goal_tool_value);
+  void calculationProcess(double present_time, JointWayPoint* goal_joint_value, std::vector<double>* goal_tool_value);
   bool getPlatformFlag();
 };
 

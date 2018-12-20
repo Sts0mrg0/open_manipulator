@@ -74,7 +74,7 @@ bool QNode::init() {
   goal_drawing_trajectory_client_ = n.serviceClient<open_manipulator_msgs::SetDrawingTrajectory>("goal_drawing_trajectory");
 
   start();
-	return true;
+  return true;
 }
 
 void QNode::run() {

@@ -24,12 +24,14 @@ OM_CONTROLLER::OM_CONTROLLER(std::string usb_port, std::string baud_rate)
     :node_handle_(""),
      priv_node_handle_("~"),
      tool_ctrl_flag_(false),
-     timer_thread_flag_(false),
+     comm_timer_thread_flag_(false),
+     cal_thread_flag_(false),
      moveit_plan_flag_(false),
      using_platform_(false),
      using_moveit_(false),
      control_period_(0.010f),
-     moveit_sampling_time_(0.050f)
+     moveit_sampling_time_(0.050f),
+     mutex_(PTHREAD_MUTEX_INITIALIZER)
 {
   control_period_ = priv_node_handle_.param<double>("control_period", 0.010f);
   moveit_sampling_time_ = priv_node_handle_.param<double>("moveit_sample_duration", 0.050f);
@@ -39,8 +41,8 @@ OM_CONTROLLER::OM_CONTROLLER(std::string usb_port, std::string baud_rate)
 
   open_manipulator_.initManipulator(using_platform_, usb_port, baud_rate);
 
-  if (using_platform_ == true)    ROS_INFO("Succeeded to init %s", priv_node_handle_.getNamespace().c_str());
-  else if (using_platform_ == false)    ROS_INFO("Ready to simulate %s on Gazebo", priv_node_handle_.getNamespace().c_str());
+  if (using_platform_ == true)        ROS_INFO("Succeeded to init %s", priv_node_handle_.getNamespace().c_str());
+  else if (using_platform_ == false)  ROS_INFO("Ready to simulate %s on Gazebo", priv_node_handle_.getNamespace().c_str());
 
   if (using_moveit_ == true)
   {
@@ -51,74 +53,146 @@ OM_CONTROLLER::OM_CONTROLLER(std::string usb_port, std::string baud_rate)
 
 OM_CONTROLLER::~OM_CONTROLLER()
 {
-  timer_thread_flag_ = false;
-  usleep(100 * 1000); // 100ms
+  comm_timer_thread_flag_ = false;
+  pthread_join(comm_timer_thread_, NULL); // Wait for the thread associated with thread_p to complete
   RM_LOG::INFO("Shutdown the OpenManipulator");
   open_manipulator_.allActuatorDisable();
   ros::shutdown();
 }
 
-void OM_CONTROLLER::setTimerThread()
+void OM_CONTROLLER::startCommTimerThread()
 {
-  int error;
-  struct sched_param param;
-  pthread_attr_init(&attr_);
+  ////////////////////////////////////////////////////////////////////
+  /// Use this when you want to increase the priority of threads.
+  ////////////////////////////////////////////////////////////////////
+  //  pthread_attr_t attr_;
+  //  int error;
+  //  struct sched_param param;
+  //  pthread_attr_init(&attr_);
 
-  error = pthread_attr_setschedpolicy(&attr_, SCHED_RR);
-  if (error != 0)
-    RM_LOG::ERROR("pthread_attr_setschedpolicy error = ", (double)error);
-  error = pthread_attr_setinheritsched(&attr_, PTHREAD_EXPLICIT_SCHED);
-  if (error != 0)
-    RM_LOG::ERROR("pthread_attr_setinheritsched error = ", (double)error);
+  //  error = pthread_attr_setschedpolicy(&attr_, SCHED_RR);
+  //  if (error != 0)   RM_LOG::ERROR("pthread_attr_setschedpolicy error = ", (double)error);
+  //  error = pthread_attr_setinheritsched(&attr_, PTHREAD_EXPLICIT_SCHED);
+  //  if (error != 0)   RM_LOG::ERROR("pthread_attr_setinheritsched error = ", (double)error);
 
-  memset(&param, 0, sizeof(param));
-  param.sched_priority = 31;    // RT
-  error = pthread_attr_setschedparam(&attr_, &param);
-  if (error != 0)
-    RM_LOG::ERROR("pthread_attr_setschedparam error = ", (double)error);
-}
-void OM_CONTROLLER::startTimerThread()
-{
+  //  memset(&param, 0, sizeof(param));
+  //  param.sched_priority = 31;    // RT
+  //  error = pthread_attr_setschedparam(&attr_, &param);
+  //  if (error != 0)   RM_LOG::ERROR("pthread_attr_setschedparam error = ", (double)error);
+
+  //  int error;
+  //  if ((error = pthread_create(&this->comm_timer_thread_, &attr_, this->commTimerThread, this)) != 0)
+  //  {
+  //    RM_LOG::ERROR("Creating timer thread failed!!", (double)error);
+  //    exit(-1);
+  //  }
+  ////////////////////////////////////////////////////////////////////
   int error;
-  if ((error = pthread_create(&this->timer_thread_, /*&attr_*/NULL, this->timerThread, this)) != 0)
+  if ((error = pthread_create(&this->comm_timer_thread_, NULL, this->commTimerThread, this)) != 0)
   {
     RM_LOG::ERROR("Creating timer thread failed!!", (double)error);
     exit(-1);
   }
-  timer_thread_flag_ = true;
+  comm_timer_thread_flag_ = true;
 }
 
-void *OM_CONTROLLER::timerThread(void *param)
+void *OM_CONTROLLER::commTimerThread(void *param)
 {
   OM_CONTROLLER *controller = (OM_CONTROLLER *) param;
+  JointWayPoint tx_joint_way_point;
+  std::vector<double> tx_tool_way_point;
   static struct timespec next_time;
   static struct timespec curr_time;
 
   clock_gettime(CLOCK_MONOTONIC, &next_time);
 
-  while(controller->timer_thread_flag_)
+  while(controller->comm_timer_thread_flag_)
   {
     next_time.tv_sec += (next_time.tv_nsec + ((int)(controller->getControlPeriod() * 1000)) * 1000000) / 1000000000;
     next_time.tv_nsec = (next_time.tv_nsec + ((int)(controller->getControlPeriod() * 1000)) * 1000000) % 1000000000;
 
-    double time = next_time.tv_sec + (next_time.tv_nsec*0.000000001);
-    controller->process(time);
+    pthread_mutex_lock(&(controller->mutex_));  // mutex lock
+
+    if(controller->joint_way_point_buf_.size()) // get JointWayPoint for transfer to actuator
+    {
+      tx_joint_way_point = controller->joint_way_point_buf_.front();
+      controller->present_joint_value = tx_joint_way_point;
+      controller->joint_way_point_buf_.pop();
+    }
+    if(controller->tool_way_point_buf_.size())  // get ToolWayPoint for transfer to actuator
+    {
+      tx_tool_way_point = controller->tool_way_point_buf_.front();
+      controller->tool_way_point_buf_.pop();
+    }
+
+    pthread_mutex_unlock(&(controller->mutex_)); // mutex unlock
+
+    controller->open_manipulator_.communicationProcessToActuator(tx_joint_way_point, tx_tool_way_point);
+    tx_joint_way_point.clear();
+    tx_tool_way_point.clear();
 
     clock_gettime(CLOCK_MONOTONIC, &curr_time);
 
     /////
     double delta_nsec = (next_time.tv_sec - curr_time.tv_sec) + (next_time.tv_nsec - curr_time.tv_nsec)*0.000000001;
-//    RM_LOG::INFO("control time : ", controller->getControlPeriod() - delta_nsec);
     if(delta_nsec < 0.0)
     {
-      RM_LOG::WARN("Over the control time : ", controller->getControlPeriod() - delta_nsec);
+      RM_LOG::WARN("Communication cycle time exceeded. : ", controller->getControlPeriod() - delta_nsec);
       next_time = curr_time;
     }
     else
       clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &next_time, NULL);
     /////
   }
+  return 0;
+}
 
+void OM_CONTROLLER::startCalThread()
+{
+  int error;
+  if ((error = pthread_create(&this->cal_thread_, NULL, this->calThread, this)) != 0)
+  {
+    RM_LOG::ERROR("Creating calculation thread failed!!", (double)error);
+    exit(-1);
+  }
+  cal_thread_flag_ = true;
+}
+
+void *OM_CONTROLLER::calThread(void *param)
+{
+  OM_CONTROLLER *controller = (OM_CONTROLLER *) param;
+  static struct timespec next_time;
+  static struct timespec curr_time;
+  static struct timespec temp_time;
+
+  clock_gettime(CLOCK_MONOTONIC, &curr_time);
+  double curr_time_s = curr_time.tv_sec + (curr_time.tv_nsec*0.000000001);
+
+  next_time = curr_time;
+
+  while(controller->cal_thread_flag_)
+  {
+    next_time.tv_sec += (next_time.tv_nsec + ((int)(controller->getControlPeriod() * 1000)) * 1000000) / 1000000000;
+    next_time.tv_nsec = (next_time.tv_nsec + ((int)(controller->getControlPeriod() * 1000)) * 1000000) % 1000000000;
+    double next_time_s = next_time.tv_sec + (next_time.tv_nsec*0.000000001);
+
+    JointWayPoint tempJointWayPoint;
+    std::vector<double> tempToolWayPoint;
+    controller->open_manipulator_.calculationProcess(next_time_s, &tempJointWayPoint, &tempToolWayPoint);
+
+    pthread_mutex_lock(&(controller->mutex_)); // mutex lock
+    controller->joint_way_point_buf_.push(tempJointWayPoint);
+    controller->tool_way_point_buf_.push(tempToolWayPoint);
+    pthread_mutex_unlock(&(controller->mutex_)); // mutex unlock
+
+    // debug
+    clock_gettime(CLOCK_MONOTONIC, &temp_time);
+    double delta_nsec = (next_time.tv_sec - temp_time.tv_sec) + (next_time.tv_nsec - temp_time.tv_nsec)*0.000000001;
+    RM_LOG::INFO("control time : ", delta_nsec);
+
+    if(controller->open_manipulator_.getTrajectoryMoveTime() < (next_time_s - curr_time_s))
+      controller->cal_thread_flag_ = false;
+  }
   return 0;
 }
 
@@ -216,7 +290,9 @@ bool OM_CONTROLLER::goalJointSpacePathCallback(open_manipulator_msgs::SetJointPo
   for(int i = 0; i < req.joint_position.joint_name.size(); i ++)
     target_angle.push_back(req.joint_position.position.at(i));
 
-  open_manipulator_.jointTrajectoryMove(target_angle, req.path_time);
+  pthread_mutex_lock(&mutex_); // mutex lock
+  open_manipulator_.jointTrajectoryMove(target_angle, req.path_time, present_joint_value);
+  pthread_mutex_unlock(&mutex_); // mutex unlock
 
   res.is_planned = true;
   return true;
@@ -356,18 +432,18 @@ bool OM_CONTROLLER::setActuatorStateCallback(open_manipulator_msgs::SetActuatorS
   if(req.set_actuator_state == true) // torque on
   {
     RM_LOG::INFO("Wait a second for actuator enable");
-    timer_thread_flag_ = false;
-    usleep(100 * 1000); // 100ms
+    comm_timer_thread_flag_ = false;
+    pthread_join(comm_timer_thread_, NULL); // Wait for the thread associated with thread_p to complete
     open_manipulator_.allActuatorEnable();
-    startTimerThread();
+    startCommTimerThread();
   }
   else // torque off
   {
     RM_LOG::INFO("Wait a second for actuator disable");
-    timer_thread_flag_ = false;
-    usleep(100 * 1000); // 100ms
+    comm_timer_thread_flag_ = false;
+    pthread_join(comm_timer_thread_, NULL); // Wait for the thread associated with thread_p to complete
     open_manipulator_.allActuatorDisable();
-    startTimerThread();
+    startCommTimerThread();
   }
 
   res.is_planned = true;
@@ -721,7 +797,6 @@ void OM_CONTROLLER::moveitTimer(double present_time)
 void OM_CONTROLLER::process(double time)
 {
   moveitTimer(time);
-  open_manipulator_.openManipulatorProcess(time);
 }
 
 int main(int argc, char **argv)
@@ -749,8 +824,7 @@ int main(int argc, char **argv)
   om_controller.initSubscriber();
   om_controller.initServer();
 
-  om_controller.setTimerThread();
-  om_controller.startTimerThread();
+  om_controller.startCommTimerThread();
 
   ros::Timer publish_timer = node_handle.createTimer(ros::Duration(om_controller.getControlPeriod()), &OM_CONTROLLER::publishCallback, &om_controller);
 
